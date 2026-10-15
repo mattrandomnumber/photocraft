@@ -79,7 +79,7 @@ impl LenUnit {
 }
 
 /// Align glyph: a reference line and two bars (Photoshop's align icons).
-fn align_glyph(ui: &egui::Ui, r: Rect, kind: &str, color: egui::Color32) {
+pub(crate) fn align_glyph(ui: &egui::Ui, r: Rect, kind: &str, color: egui::Color32) {
     let p = ui.painter();
     let c = r.center();
     let s = Stroke::new(1.2, color);

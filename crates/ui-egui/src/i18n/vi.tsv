@@ -909,6 +909,7 @@
 	Commit current crop operation  ({key})	Áp dụng thao tác cắt hiện tại  ({key})
 	Cancel current crop operation  (Esc)	Hủy thao tác cắt hiện tại  (Esc)
 	Align and distribute	Căn chỉnh và phân bố
+	Align To	Căn theo
 	Align left edges	Căn cạnh trái
 	Align horizontal centers	Căn tâm ngang
 	Align right edges	Căn cạnh phải

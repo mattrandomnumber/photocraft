@@ -132,6 +132,7 @@ pub mod menu_keys;
 pub mod menu_nav;
 pub mod menus;
 pub mod monitor_status;
+pub mod move_align_ui;
 pub mod move_box;
 pub mod move_hover;
 pub mod move_lock;

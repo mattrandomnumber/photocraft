@@ -612,6 +612,10 @@ pub struct ToolOptions {
     pub move_target: String,
     #[serde(default)]
     pub move_show_transform: bool,
+    /// Move tool's Align To: "selection" (the selected layers, or the selection / canvas for one
+    /// layer, as Photoshop's default) or "canvas".
+    #[serde(default = "default_move_align_to")]
+    pub move_align_to: String,
     /// Crop options bar: aspect ratio ("" = Ratio/unconstrained, "w:h", or "original") and
     /// Delete Cropped Pixels.
     #[serde(default)]
@@ -720,6 +724,10 @@ fn default_crop_resolution_unit() -> String {
     crate::crop_size::PX_PER_IN.into()
 }
 
+fn default_move_align_to() -> String {
+    "selection".into()
+}
+
 fn default_move_target() -> String {
     "group".into()
 }
@@ -823,6 +831,7 @@ impl Default for ToolOptions {
             move_auto_select: true,
             move_target: default_move_target(),
             move_show_transform: false,
+            move_align_to: default_move_align_to(),
             crop_ratio: String::new(),
             crop_custom_ratio_width: 0.0,
             crop_custom_ratio_height: 0.0,
