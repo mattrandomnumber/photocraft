@@ -40,6 +40,17 @@ pub fn import_flat(name: &str, bytes: &[u8]) -> Result<ImportResult, IoError> {
     if format == Some(Format::Tga) && img.layout() == ChannelLayout::Rgba {
         tga_alpha_to_channel(&mut r.document)?;
     }
+    // Fully transparent pixels keep whatever colour the file stored (often white): clear them, as
+    // Photoshop does on open, so they count as empty for Free Transform's box, Trim, snapping and
+    // the Move tool's bounds instead of stretching those to the whole canvas. A palette image
+    // keeps its pixels as they are.
+    if r.document.mode != ColorMode::Indexed {
+        for layer in &mut r.document.layers {
+            if let LayerContent::Raster(s) = &mut layer.content {
+                clear_transparent_colour(s);
+            }
+        }
+    }
     // OpenEXR and Radiance HDR hold linear, scene-referred values (Rec. 709 primaries unless
     // stated otherwise, and an OpenEXR `Y` is linear luminance): tag them linear sRGB or linear
     // gray so they display and convert correctly.
@@ -52,6 +63,35 @@ pub fn import_flat(name: &str, bytes: &[u8]) -> Result<ImportResult, IoError> {
         };
     }
     Ok(r)
+}
+
+/// Sets every fully transparent pixel of `s` to its empty (default) pixel, dropping the colour a
+/// file stored there, then drops tiles left empty. Only for a surface with alpha whose default is
+/// itself fully transparent; anything else is left alone.
+pub(crate) fn clear_transparent_colour(s: &mut Surface) {
+    use rayon::prelude::*;
+    let fmt = s.format();
+    let (ch, bpp) = (fmt.channels(), fmt.bytes_per_pixel());
+    if !fmt.alpha || ch < 2 || bpp == 0 {
+        return;
+    }
+    let dp = s.default_bytes().to_vec();
+    let transparent = |px: &[u8]| photocraft_color::read_sample(px, fmt.sample, ch - 1) <= 0.0;
+    if dp.len() != bpp || !transparent(&dp) {
+        return;
+    }
+    let mut tiles = s.take_tiles(s.tile_bounds());
+    tiles.par_iter_mut().for_each(|(_, tile)| {
+        if tile.bytes().chunks_exact(bpp).any(|px| transparent(px) && px != dp.as_slice()) {
+            for px in Arc::make_mut(tile).bytes_mut().chunks_exact_mut(bpp) {
+                if transparent(px) {
+                    px.copy_from_slice(&dp);
+                }
+            }
+        }
+    });
+    s.put_tiles(tiles);
+    s.prune();
 }
 
 /// Every frame of a GIF as a single-layer document, handed to `each` in order with its delay in
@@ -194,7 +234,14 @@ pub fn import_tiff_page(name: &str, bytes: &[u8], page: Option<usize>) -> Result
         }
         return Ok(r);
     }
-    image_to_document(name, &img.oriented(orientation)?)
+    // A flat TIFF's transparency opens like a PNG's: fully transparent pixels empty.
+    let mut r = image_to_document(name, &img.oriented(orientation)?)?;
+    for layer in &mut r.document.layers {
+        if let LayerContent::Raster(s) = &mut layer.content {
+            clear_transparent_colour(s);
+        }
+    }
+    Ok(r)
 }
 
 /// A decoded flat image as a single-layer document: a locked "Background" when it is opaque, a

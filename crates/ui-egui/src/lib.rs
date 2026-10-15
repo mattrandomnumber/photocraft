@@ -2578,6 +2578,12 @@ impl PhotocraftApp {
             return false;
         }
         let r = photocraft_geom::Rect::new(0, 0, w as i32, h as i32);
+        // Fully transparent pixels often keep a colour (browsers copy them white): make them
+        // empty, so the pasted layer's bounds are the image's visible part (Free Transform's box).
+        let mut bytes = bytes;
+        for px in bytes.as_chunks_mut::<4>().0.iter_mut().filter(|px| px[3] == 0) {
+            *px = [0; 4];
+        }
         let mut surface = photocraft_raster::Surface::from_interleaved(photocraft_color::PixelFormat::RGBA8, r, &bytes);
         surface.prune();
         self.session.clipboard = Some(photocraft_engine::edit_cmds::Clip { surface, bounds: r, layers: None, resolution: None });
@@ -2803,6 +2809,20 @@ mod clipboard_tests {
         let mut plain = PhotocraftApp::new(Session::new(), Services::default());
         plain.session.execute("file.new", serde_json::json!({"width": 8, "height": 8})).unwrap();
         assert!(!crate::menus::is_enabled(&plain, "edit.paste"));
+    }
+
+    /// An image copied from a browser keeps white in its transparent pixels: they paste as empty,
+    /// so the pasted layer's bounds (Free Transform's box) are its visible part only.
+    #[test]
+    fn transparent_pixels_of_an_os_clipboard_image_paste_empty() {
+        let mut px = [255u8, 255, 255, 0].repeat(16);
+        px[(4 + 1) * 4..(4 + 1) * 4 + 4].copy_from_slice(&[10, 20, 30, 255]);
+        let get = move || Some((4, 4, px.clone()));
+        let mut app = PhotocraftApp::new(Session::new(), Services { clipboard_get_image: Some(Box::new(get)), ..Default::default() });
+        assert!(app.import_os_clipboard());
+        let clip = app.session.clipboard.as_ref().unwrap();
+        assert_eq!(clip.surface.content_bounds(), photocraft_geom::Rect::new(1, 1, 2, 2));
+        assert_eq!(clip.bounds, photocraft_geom::Rect::new(0, 0, 4, 4), "placed as the copied image was");
     }
 
     /// #368: an image copied in another app opens as a document of its own, from File › New

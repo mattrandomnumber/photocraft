@@ -998,3 +998,31 @@ fn a_lab_document_with_one_layer_is_not_reported_as_flattened() {
     let r = export(&two, "tif", &ExportOptions::default()).unwrap();
     assert!(r.warnings.iter().any(|w| w.contains("2 layer(s) flattened")), "{:?}", r.warnings);
 }
+
+/// A PNG whose transparent pixels store white (as many apps write them) opens with those pixels
+/// empty, so the layer's bounds are its art, not the whole canvas: Free Transform's box, Trim and
+/// snapping then fit the art, as in Photoshop. The art itself is untouched.
+#[test]
+fn transparent_pixels_open_empty_whatever_colour_the_file_stored() {
+    use photocraft_color::PixelFormat;
+    use photocraft_geom::Rect;
+    for depth in [SampleType::U8, SampleType::U16] {
+        let mut d = photocraft_doc::Document::new("t", photocraft_geom::Size::new(300, 200), ColorMode::Rgb, depth);
+        let fmt = PixelFormat::new(ColorMode::Rgb, depth, true);
+        let mut layer = photocraft_doc::Layer::raster("Layer 0", fmt);
+        let s = layer.surface_mut().expect("raster");
+        s.fill_rect(d.bounds(), &[1.0, 1.0, 1.0, 0.0]);
+        s.fill_rect(Rect::new(40, 30, 90, 70), &[0.2, 0.4, 0.8, 1.0]);
+        assert_eq!(s.content_bounds(), d.bounds(), "white transparent pixels count as content until cleared");
+        d.layers.push(layer);
+        let png = export(&d, "png", &ExportOptions::default()).expect("export").bytes;
+        let back = import("t.png", &png).expect("import").document;
+        let s = back.layers[0].surface().expect("raster");
+        assert_eq!(s.content_bounds(), Rect::new(40, 30, 90, 70), "{depth:?}");
+        let art = s.pixel(60, 50);
+        for (got, want) in art.iter().zip([0.2, 0.4, 0.8, 1.0]) {
+            assert!((got - want).abs() < 0.01, "{depth:?}: art pixel {art:?}");
+        }
+        assert_eq!(s.pixel(5, 5), vec![0.0; 4], "{depth:?}: a cleared pixel is the empty pixel");
+    }
+}

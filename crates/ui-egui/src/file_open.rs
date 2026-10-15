@@ -131,6 +131,12 @@ impl PhotocraftApp {
         let batch = crate::jobs_ui::begin_batch(self);
         let mut opened = 0;
         for (seq, abs) in paths.iter().enumerate() {
+            // Already open: show its tab instead of opening a second copy, as Photoshop does.
+            if let Some(i) = self.session.documents().iter().position(|d| d.path.as_deref().is_some_and(|p| same_file(p, abs))) {
+                self.session.set_active(i);
+                opened += 1;
+                continue;
+            }
             let order = crate::jobs_ui::OpenOrder { batch, seq };
             let pending = self.jobs.opens.len();
             match self.open_path(abs) {
@@ -272,6 +278,16 @@ impl PhotocraftApp {
             }
         }
     }
+}
+
+/// Whether two absolute paths name the same file: separators and, on Windows and macOS (whose
+/// file systems ignore case by default), letter case don't matter.
+pub(crate) fn same_file(a: &str, b: &str) -> bool {
+    let norm = |p: &str| {
+        let p = p.replace('\\', "/");
+        if cfg!(any(windows, target_os = "macos")) { p.to_lowercase() } else { p }
+    };
+    norm(a) == norm(b)
 }
 
 /// Order names like a file browser does: runs of digits by their value (`File_2` before

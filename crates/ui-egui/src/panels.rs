@@ -1361,9 +1361,19 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
                         ),
                     ),
                     Tool::Move => {
-                        // The Studio themes keep Photoshop's Auto-Select toggle too (#1275).
-                        widgets::checkbox(ui, &mut app.ui.tool_options.move_auto_select, tl!("Auto-Select:"));
-                        // Photoshop's align buttons in every theme, not just Pro.
+                        // The Studio themes keep Photoshop's Auto-Select toggle too (#1275), and here its
+                        // Layer / Group target, Show Transform Controls and the align buttons as well.
+                        let o = &mut app.ui.tool_options;
+                        widgets::checkbox(ui, &mut o.move_auto_select, tl!("Auto-Select:"));
+                        widgets::dropdown(
+                            ui,
+                            "move-target",
+                            &mut o.move_target,
+                            &[("layer".to_string(), tl!("Layer")), ("group".to_string(), tl!("Group"))],
+                            76.0,
+                        );
+                        widgets::vline(ui, 22.0);
+                        widgets::checkbox(ui, &mut o.move_show_transform, tl!("Show Transform Controls"));
                         crate::move_align_ui::options(app, ui);
                         hint(ui, tl!("Drag to move the active layer"));
                     }

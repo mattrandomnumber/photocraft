@@ -167,9 +167,10 @@ fn become_primary(lock: File, info_path: &Path) -> Option<Primary> {
                 break;
             }
             let Ok(stream) = stream else { continue };
-            match receive(stream, &token) {
-                Ok(paths) if !receiving.closed.load(Ordering::SeqCst) => receiving.push(paths),
-                Ok(_) => break,
+            // Accepted only while still open: on the way out, no `ok`, so the sender opens a
+            // window of its own rather than handing its files to an instance about to exit.
+            match receive(stream, &token, &receiving.closed) {
+                Ok(paths) => receiving.push(paths),
                 Err(e) => log::warn!("single instance: rejected a handoff: {e}"),
             }
         }
@@ -190,21 +191,29 @@ fn new_token() -> Result<String, String> {
 /// Writes `port` and `token` beside the lock, replacing the file whole.
 fn write_info(path: &Path, port: u16, token: &str) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, json!({"port": port, "token": token}).to_string())?;
+    std::fs::write(&tmp, json!({"port": port, "token": token, "pid": std::process::id()}).to_string())?;
     std::fs::rename(&tmp, path)
 }
 
-fn read_info(path: &Path) -> Result<(u16, String), String> {
+/// The running instance's port, token and process id (`None` in a file written before it was kept).
+fn read_info(path: &Path) -> Result<(u16, String, Option<u32>), String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     let port = v.get("port").and_then(Value::as_u64).and_then(|p| u16::try_from(p).ok()).ok_or("no port")?;
     let token = v.get("token").and_then(Value::as_str).ok_or("no token")?;
-    Ok((port, token.to_owned()))
+    let pid = v.get("pid").and_then(Value::as_u64).and_then(|p| u32::try_from(p).ok());
+    Ok((port, token.to_owned(), pid))
 }
 
 /// Sends `paths` to the running instance; `Ok` once it has accepted them.
 fn hand_off(info_path: &Path, paths: &[String]) -> Result<(), String> {
-    let (port, token) = read_info(info_path)?;
+    let (port, token, pid) = read_info(info_path)?;
+    // Windows only lets the app the user just launched take the foreground: pass that right on,
+    // so the running window can come to the front instead of just flashing in the taskbar.
+    #[cfg(not(windows))]
+    let _ = pid;
+    #[cfg(windows)]
+    let _ = winsafe::AllowSetForegroundWindow(Some(pid.unwrap_or(u32::MAX)));
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500)).map_err(|e| e.to_string())?;
     stream.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
@@ -216,12 +225,15 @@ fn hand_off(info_path: &Path, paths: &[String]) -> Result<(), String> {
 }
 
 /// Reads one handoff from `stream`, answering `ok` if it carries `token`.
-fn receive(mut stream: TcpStream, token: &str) -> Result<Vec<String>, String> {
+fn receive(mut stream: TcpStream, token: &str, closed: &AtomicBool) -> Result<Vec<String>, String> {
     stream.set_read_timeout(Some(Duration::from_secs(2))).map_err(|e| e.to_string())?;
     stream.set_write_timeout(Some(Duration::from_secs(2))).map_err(|e| e.to_string())?;
     let mut line = String::new();
     BufReader::new((&stream).take(MAX_MESSAGE)).read_line(&mut line).map_err(|e| e.to_string())?;
     let paths = parse_message(&line, token)?;
+    if closed.load(Ordering::SeqCst) {
+        return Err("closing".into());
+    }
     stream.write_all(b"ok\n").map_err(|e| e.to_string())?;
     Ok(paths)
 }

@@ -20,6 +20,8 @@ photocraft-geom = { workspace = true }
 photocraft-color = { workspace = true }
 photocraft-cms = { workspace = true }
 photocraft-raster = { workspace = true }
+# Clearing fully transparent pixels on import, per tile (`flat.rs`).
+rayon = { workspace = true }
 photocraft-doc = { workspace = true }
 photocraft-compose = { workspace = true }
 photocraft-algo = { workspace = true }

@@ -883,3 +883,23 @@ fn opening_type_in_a_missing_font_warns() {
     // The importer's own warning for the same font isn't doubled.
     assert_eq!(app.open_bytes("warned.psd", b"x").unwrap(), vec![warning]);
 }
+
+/// Opening a file that is already open shows its tab instead of a second copy, as Photoshop does
+/// (an Explorer double-click handed over by a second launch included).
+#[test]
+fn opening_an_open_file_again_switches_to_its_tab() {
+    let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+    for _ in 0..2 {
+        app.run("file.new", serde_json::json!({"width": 8, "height": 8})).unwrap();
+    }
+    let path = if cfg!(windows) { r"C:\art\Shirt.psd" } else { "/art/Shirt.psd" };
+    app.session.set_active(0);
+    app.session.active_mut().unwrap().path = Some(path.into());
+    app.session.set_active(1);
+    let again = if cfg!(windows) { "c:/art/shirt.psd" } else { path };
+    assert_eq!(app.open_paths(&[again.to_string()]), 1);
+    assert_eq!(app.session.documents().len(), 2, "no second copy");
+    assert_eq!(app.session.active_index(), Some(0), "its tab is shown");
+    assert!(super::same_file(r"C:\a\b.png", "C:/a/b.png"));
+    assert!(!super::same_file("/a/b.png", "/a/c.png"));
+}

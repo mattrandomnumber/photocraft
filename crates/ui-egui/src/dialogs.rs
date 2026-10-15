@@ -380,7 +380,12 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
                         };
                         // Dialogs that need an input first (a preset name, a selection) grey OK out.
                         let can_ok = crate::crop_presets::can_confirm(app, &fields) && crate::stack_dialog::can_confirm(&fields);
-                        let ok = DialogButton::new(ButtonRole::Default, ok_label, 84.0).enabled(can_ok);
+                        // Yes/no prompts (no fields to type in) focus their default answer on Windows
+                        // and Linux, as Photoshop does: one Tab reaches the next button.
+                        let prompt_focus = ui.ctx().os() != egui::os::OperatingSystem::Mac;
+                        let ok = DialogButton::new(ButtonRole::Default, ok_label, 84.0)
+                            .enabled(can_ok)
+                            .focused(prompt_focus && crate::delete_layer_prompt::owns(&d.fields));
                         // Photoshop: holding Alt turns Cancel into Reset (the dialog stays open).
                         // Dialogs opt in via `dialog_alt_reset::supported` (per marker).
                         let reset = ui.input(|i| i.modifiers.alt) && crate::dialog_alt_reset::supported(&fields);
@@ -397,7 +402,9 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
                             dialog_buttons(ui, &[ok, cancel, DialogButton::new(ButtonRole::Apply, tl!("Apply"), 84.0).enabled(changed)])
                         } else if crate::mask_trash_prompt::owns(&fields) && !crate::mask_trash_prompt::is_vector(&fields) {
                             // Photoshop: Apply / Cancel / Delete. Delete answers with the choice set.
-                            let apply = DialogButton::new(ButtonRole::Default, tl!("Apply"), 84.0).enabled(crate::mask_trash_prompt::can_apply(&fields));
+                            let apply = DialogButton::new(ButtonRole::Default, tl!("Apply"), 84.0)
+                                .enabled(crate::mask_trash_prompt::can_apply(&fields))
+                                .focused(prompt_focus);
                             let delete = DialogButton::new(ButtonRole::Alternate, tl!("Delete"), 84.0);
                             let hit = dialog_buttons(ui, &[apply, cancel, delete]);
                             if hit == Some(ButtonRole::Alternate) {
@@ -408,7 +415,7 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
                             hit
                         } else if crate::rasterize_prompt::is_filter(&fields) {
                             // Photoshop: Convert to Smart Object / Rasterize / Cancel (#4303).
-                            let rasterize = DialogButton::new(ButtonRole::Default, tl!("Rasterize"), 84.0);
+                            let rasterize = DialogButton::new(ButtonRole::Default, tl!("Rasterize"), 84.0).focused(prompt_focus);
                             let hit = if crate::rasterize_prompt::offers_smart_object(&fields) {
                                 let convert = DialogButton::new(ButtonRole::Alternate, tl!("Convert to Smart Object"), 160.0);
                                 dialog_buttons(ui, &[rasterize, cancel, convert])
