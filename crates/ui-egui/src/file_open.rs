@@ -262,7 +262,9 @@ impl PhotocraftApp {
             match e {
                 OsEvent::Open(paths) => {
                     self.open_paths(&paths);
-                    // Bring the window forward when another app (Finder, the Dock) asked us to open.
+                    // Bring the window forward when another app (Finder, the Dock, Explorer) asked
+                    // us to open, restoring it first if it was minimized.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     ctx.request_repaint();
                 }

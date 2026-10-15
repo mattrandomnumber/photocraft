@@ -266,7 +266,9 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
     };
     let mut answer = ctx.input_mut(|i| buttons.iter().find(|b| b.2.is_some_and(|k| i.consume_key(egui::Modifiers::NONE, k))).map(|b| b.4));
     let labels: Vec<String> = buttons.iter().map(|b| button_label(mac, b.1, b.2)).collect();
-    let row: Vec<DialogButton> = buttons.iter().zip(&labels).map(|(b, label)| DialogButton::new(b.0, label, b.3)).collect();
+    // Windows and Linux focus the default answer, as Photoshop does there: one Tab reaches No.
+    let row: Vec<DialogButton> =
+        buttons.iter().zip(&labels).map(|(b, label)| DialogButton::new(b.0, label, b.3).focused(!mac && b.0 == ButtonRole::Default)).collect();
     let modal = egui::Modal::new(egui::Id::new("discard-prompt")).show(ctx, |ui| {
         ui.set_max_width(420.0);
         ui.label(egui::RichText::new(tl!(&title)).font(crate::theme::semibold(15.0)));
@@ -277,7 +279,8 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
         ui.add_space(12.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
-            if let Some(role) = crate::widgets::dialog_buttons(ui, &row) {
+            // Scoped by document, so the next document asked about starts again from the default.
+            if let Some(role) = ui.push_id(doc, |ui| crate::widgets::dialog_buttons(ui, &row)).inner {
                 answer = buttons.iter().find(|b| b.0 == role).map(|b| b.4);
             }
         });
@@ -569,18 +572,24 @@ mod tests {
         v.into_iter().map(|(_, l)| l).collect()
     }
 
-    /// Tab walks `labels` left to right and wraps; Shift+Tab steps back.
-    fn tab_walks(h: &mut Prompted, labels: [&str; 3]) {
+    /// The one of `labels` with keyboard focus.
+    fn focused<'a>(h: &Prompted, labels: [&'a str; 3]) -> Option<&'a str> {
         use egui_kittest::kittest::Queryable;
-        let focused = |h: &Prompted| labels.into_iter().find(|l| h.get_by_label(l).is_focused());
-        for want in [labels[0], labels[1], labels[2], labels[0]] {
+        labels.into_iter().find(|l| h.get_by_label(l).is_focused())
+    }
+
+    /// Tab walks `labels` left to right from `start` (focused at first) and wraps; Shift+Tab steps back.
+    fn tab_walks(h: &mut Prompted, labels: [&str; 3], start: Option<&str>) {
+        assert_eq!(focused(h, labels), start);
+        let walk = if start.is_some() { [labels[1], labels[2], labels[0], labels[1]] } else { [labels[0], labels[1], labels[2], labels[0]] };
+        for want in walk {
             h.key_press(Key::Tab);
             h.run_steps(2);
-            assert_eq!(focused(h), Some(want));
+            assert_eq!(focused(h, labels), Some(want));
         }
         h.key_press_modifiers(egui::Modifiers::SHIFT, Key::Tab);
         h.run_steps(2);
-        assert_eq!(focused(h), Some(labels[2]));
+        assert_eq!(focused(h, labels), Some(walk[2]));
     }
 
     fn docs_left(h: &Prompted) -> Option<usize> {
@@ -593,7 +602,7 @@ mod tests {
             let mut h = prompt_on(os);
             let labels = ["(Y)es", "(N)o", "(C)ancel"];
             assert_eq!(drawn_order(&h, labels), labels, "{os:?}");
-            tab_walks(&mut h, labels);
+            tab_walks(&mut h, labels, Some(labels[0]));
             h.key_press(Key::N);
             h.run_steps(2);
             assert_eq!(docs_left(&h), Some(1), "N answered the first document");
@@ -602,6 +611,22 @@ mod tests {
             assert!(h.state().discard.is_none());
             assert_eq!(h.state().session.documents().len(), 1, "Cancel keeps the unanswered document");
         }
+    }
+
+    /// Photoshop on Windows: Yes is focused, so one Tab and Space answers No, and the next
+    /// document asked about starts from Yes again.
+    #[test]
+    fn one_tab_then_space_answers_no_and_the_next_prompt_starts_on_yes() {
+        let mut h = prompt_on(egui::os::OperatingSystem::Windows);
+        let labels = ["(Y)es", "(N)o", "(C)ancel"];
+        assert_eq!(focused(&h, labels), Some("(Y)es"));
+        h.key_press(Key::Tab);
+        h.run_steps(2);
+        h.key_press(Key::Space);
+        h.run_steps(2);
+        assert_eq!(docs_left(&h), Some(1), "Space on No answered the first document");
+        assert_eq!(h.state().session.documents().len(), 1);
+        assert_eq!(focused(&h, labels), Some("(Y)es"));
     }
 
     /// Whether the prompt is asking about the document called `name`.
@@ -673,7 +698,7 @@ mod tests {
         let mut h = prompt_on(egui::os::OperatingSystem::Mac);
         let labels = ["Don't Save", "Cancel", "Save"];
         assert_eq!(drawn_order(&h, labels), labels);
-        tab_walks(&mut h, labels);
+        tab_walks(&mut h, labels, None);
         h.key_press(Key::D);
         h.run_steps(2);
         assert_eq!(docs_left(&h), Some(1), "D answered the first document");
@@ -710,11 +735,9 @@ mod tests {
         h.run_steps(2);
         assert_eq!(asked.borrow().len(), 1, "Enter answered Yes, which saves");
         assert_eq!(docs_left(&h), Some(2));
-        // Tab to No: Enter now presses it.
-        for _ in 0..2 {
-            h.key_press(Key::Tab);
-            h.run_steps(2);
-        }
+        // Tab to No (Yes starts focused): Enter now presses it.
+        h.key_press(Key::Tab);
+        h.run_steps(2);
         h.key_press(Key::Enter);
         h.run_steps(2);
         assert_eq!(asked.borrow().len(), 1, "no second dialog");

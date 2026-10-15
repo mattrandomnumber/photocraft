@@ -1179,15 +1179,21 @@ pub struct DialogButton<'a> {
     pub label: &'a str,
     pub min_width: f32,
     pub enabled: bool,
+    /// Takes keyboard focus when the row first appears, so Tab starts from here.
+    pub focused: bool,
 }
 
 impl<'a> DialogButton<'a> {
     pub fn new(role: ButtonRole, label: &'a str, min_width: f32) -> Self {
-        Self { role, label, min_width, enabled: true }
+        Self { role, label, min_width, enabled: true, focused: false }
     }
 
     pub fn enabled(self, enabled: bool) -> Self {
         Self { enabled, ..self }
+    }
+
+    pub fn focused(self, focused: bool) -> Self {
+        Self { focused, ..self }
     }
 }
 
@@ -1204,6 +1210,15 @@ pub fn dialog_buttons(ui: &mut Ui, buttons: &[DialogButton]) -> Option<ButtonRol
     }) + vec2(gap * buttons.len().saturating_sub(1) as f32, 0.0);
     ui.allocate_ui_with_layout(size, egui::Layout::left_to_right(egui::Align::Center), |ui| {
         let mut hit = None;
+        // Shown last pass too? Only a row that just appeared takes the focus, so Tab wrapping
+        // around (no button focused for a pass) isn't pulled back.
+        let (seen, pass) = (ui.id().with("dialog-buttons-shown"), ui.ctx().cumulative_pass_nr());
+        let appeared = ui.ctx().data_mut(|d| {
+            let last: Option<u64> = d.get_temp(seen);
+            d.insert_temp(seen, pass);
+            last.is_none_or(|last| last.saturating_add(1) < pass)
+        });
+        let mut autofocus = None;
         for slot in 0..4 {
             for b in buttons.iter().filter(|b| b.role.slot(mac) == slot) {
                 let r = ui
@@ -1214,7 +1229,13 @@ pub fn dialog_buttons(ui: &mut Ui, buttons: &[DialogButton]) -> Option<ButtonRol
                 if r.clicked() {
                     hit = Some(b.role);
                 }
+                if appeared && b.focused && b.enabled {
+                    autofocus = Some(r.id);
+                }
             }
+        }
+        if let Some(id) = autofocus {
+            ui.memory_mut(|m| m.request_focus(id));
         }
         hit
     })

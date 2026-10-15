@@ -2,7 +2,11 @@
 //!
 //! Usage: `photocraft [--control <port>] [--control-token <64-hex> |
 //! --control-token-file <path>] [--automation-read-root <dir>]
-//! [--automation-write-root <dir>] [--safe-gpu] [--in-window-menus] [files…]`
+//! [--automation-write-root <dir>] [--safe-gpu] [--in-window-menus] [--new-instance] [files…]`
+//!
+//! Files given while PhotoCraft is already running open as tabs in that window instead of a new
+//! one (Windows, Linux; macOS does this itself). `--new-instance` (or `PHOTOCRAFT_NEW_INSTANCE=1`)
+//! opens a separate window anyway; see `single_instance`.
 //!
 //! `--safe-gpu` starts with the CPU renderer (no GPU canvas; a software adapter for the window
 //! where the platform has one) for this launch, e.g. after a graphics driver crash. A start that
@@ -46,6 +50,7 @@ mod monitor_profile;
 mod photoshop_settings;
 mod screen_color;
 mod services;
+mod single_instance;
 // Windows gets pen pressure from winit (WM_POINTER); the web runner has its own listener.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 mod tablet;
@@ -189,6 +194,7 @@ fn main() -> eframe::Result {
     // reported in a notice once the app is up; a control token is a usage error like a bad port.
     let mut unreadable_paths: Vec<String> = Vec::new();
     let mut safe_gpu = false;
+    let mut new_instance = false;
     let mut in_window_menus = std::env::var_os("PHOTOCRAFT_IN_WINDOW_MENUS").is_some_and(|v| !v.is_empty() && v != "0");
     let mut args = std::env::args_os().skip(1);
     while let Some(a) = args.next() {
@@ -209,6 +215,7 @@ fn main() -> eframe::Result {
             Some("--automation-read-root") => automation_read_root = args.next().map(std::path::PathBuf::from),
             Some("--automation-write-root") => automation_write_root = args.next().map(std::path::PathBuf::from),
             Some("--safe-gpu") => safe_gpu = true,
+            Some("--new-instance") => new_instance = true,
             Some("--in-window-menus") => in_window_menus = true,
             Some("--version") => {
                 println!("photocraft {}", photocraft_engine::build_info::long_version());
@@ -230,6 +237,17 @@ fn main() -> eframe::Result {
         }
         std::process::exit(code);
     }
+
+    // Already running: open the files there, as tabs, and don't start a second window.
+    let instance = if single_instance::wanted(control_port.is_some(), new_instance) {
+        match single_instance::start(single_instance::dir().as_deref(), &files) {
+            single_instance::Start::HandedOff => return Ok(()),
+            single_instance::Start::Run(primary) => primary,
+        }
+    } else {
+        None
+    };
+    let instance_ref = &instance;
 
     // The log file lives under the settings directory; opened after the arguments, so `--version`
     // and usage errors leave no file behind. Records logged until now are written to it first.
@@ -483,6 +501,10 @@ fn main() -> eframe::Result {
             }
             #[cfg(not(target_os = "macos"))]
             let _ = in_window_menus;
+            // Files opened from Explorer etc. while running arrive from later launches.
+            if let Some(primary) = instance_ref {
+                app.services.os_events = Some(primary.connect(&cc.egui_ctx));
+            }
             // Where file drags and drops are (winit 0.30 doesn't say).
             app.services.cursor_pos = cursor::service(cc);
             // The custom title bar's undecorated window must stay borderless, or its caption and
@@ -547,6 +569,8 @@ fn main() -> eframe::Result {
         if let Some(s) = sentinel.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
             s.finish();
         }
+        // The relaunch must become the instance, not hand its files back to this one.
+        drop(instance);
         if let Ok(exe) = std::env::current_exe() {
             let launched = std::process::Command::new(exe)
                 .args(std::env::args_os().skip(1))
