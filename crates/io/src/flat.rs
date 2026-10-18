@@ -43,8 +43,9 @@ pub fn import_flat(name: &str, bytes: &[u8]) -> Result<ImportResult, IoError> {
     // Fully transparent pixels keep whatever colour the file stored (often white): clear them, as
     // Photoshop does on open, so they count as empty for Free Transform's box, Trim, snapping and
     // the Move tool's bounds instead of stretching those to the whole canvas. A palette image
-    // keeps its pixels as they are.
-    if r.document.mode != ColorMode::Indexed {
+    // keeps its pixels as they are, and so does OpenEXR, where colour at zero alpha is real data
+    // (additive light over the composite).
+    if r.document.mode != ColorMode::Indexed && format != Some(Format::OpenExr) {
         for layer in &mut r.document.layers {
             if let LayerContent::Raster(s) = &mut layer.content {
                 clear_transparent_colour(s);
