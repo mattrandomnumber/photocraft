@@ -1,269 +1,413 @@
-//! One window per user on Windows and Linux, as Photoshop does: opening a file from Explorer (or
-//! `photocraft a.psd`) while PhotoCraft is already running opens it as a tab there instead of
-//! starting a second window. macOS gets this from the OS (Apple events, `apple_events`).
+//! One PhotoCraft per user on Windows and Linux (#3708): a file opened from Explorer or a file
+//! manager lands as a new tab in the running window, like Photoshop, instead of starting a second
+//! copy of the program.
 //!
-//! The first instance holds an exclusive lock on `instance.lock` in the settings folder for its
-//! whole life and listens on a loopback port it writes to `instance`, with a random token. A later
-//! launch that can't take the lock sends its (absolute) paths there as one JSON line,
-//! `{"token":…,"paths":[…]}`, waits for `ok` and exits. The running app then opens them through
-//! [`OsEvent::Open`], like a Finder double-click on macOS, and comes to the front. The lock is
-//! released by the OS when the first instance exits, crashed or not, so a stale `instance` file
-//! never blocks a start. Anything that goes wrong just opens a window of its own, as before.
+//! The first launch takes an exclusive OS lock on `instance.lock` in the settings directory (the OS
+//! drops it when the process ends, crash included), listens on a loopback port and writes the port
+//! plus a fresh 256-bit token to `instance.json`. A later launch that finds the lock taken sends its
+//! paths there; the primary queues them for the UI as [`OsEvent::Open`], which opens each one and
+//! brings the window forward. Explorer starts one process per file when several are opened at once;
+//! the lock decides the race, so they all end up as tabs in one window.
 //!
-//! `--new-instance` or `PHOTOCRAFT_NEW_INSTANCE=1` opt out; a control-server start (`--control`)
-//! always runs on its own, so agents and tests get the window they launched.
+//! The primary answers `ok` only once the UI has taken the paths. A launch that hears anything else
+//! (the primary is still starting, hung, or quitting) keeps retrying the lock, so it becomes the
+//! primary itself as soon as the old one lets go, and when its time runs out it starts a separate
+//! instance: a file is never acknowledged and then dropped. [`Primary::shutdown`] runs when the
+//! event loop ends (and before the CPU-compatibility relaunch), so a closing PhotoCraft refuses new
+//! files and frees the lock.
+//!
+//! Only for the per-user settings folder ([`skip_reason`]): a portable copy's folder beside the
+//! executable, or a `PHOTOCRAFT_CONFIG_DIR`, may be shared between users.
+//! macOS doesn't need this: LaunchServices already sends a running app an open-documents event.
+
+// Only the tests use it on macOS.
+#![cfg_attr(target_os = "macos", allow(dead_code))]
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use photocraft_ui_egui::OsEvent;
+use photocraft_automation::security::{LineRead, generate_token, read_bounded_line, token_matches};
+use photocraft_ui_egui::{OsEvent, OsEventsFn};
 use serde_json::{Value, json};
 
-/// How long a later launch keeps trying to reach the first instance (which may itself still be
-/// starting, e.g. when Explorer launches one process per selected file at once).
-const HANDOFF_WAIT: Duration = Duration::from_secs(10);
-/// The most a handoff message may be: plenty for thousands of paths.
-const MAX_MESSAGE: u64 = 1 << 20;
+const LOCK_FILE: &str = "instance.lock";
+const INFO_FILE: &str = "instance.json";
+/// More paths than this in one request is not a file manager.
 const MAX_PATHS: usize = 4096;
+/// Launches served at once; a stalled client holds only its own slot, never the next launch.
+const MAX_CLIENTS: usize = 8;
+/// Kept out of the hand-off's budget, so the primary answers before the launch gives up on it.
+const REPLY_MARGIN: Duration = Duration::from_millis(500);
 
-/// What `main` does after [`start`].
-pub enum Start {
-    /// The running instance took the files: exit now.
-    HandedOff,
-    /// Open a window. `Some`: this is the first instance, receiving later launches' files.
-    Run(Option<Primary>),
+/// How long each side waits (shortened in tests).
+#[derive(Clone, Copy, Debug)]
+pub struct Timing {
+    /// A later launch's whole budget for handing its paths over (or taking the lock over).
+    pub handoff: Duration,
+    /// How long the primary waits for its UI to take a launch's paths before refusing them.
+    pub ack: Duration,
+    /// Total time a connection gets to send its request line.
+    pub request: Duration,
 }
 
-/// The first instance: holds the lock and receives later launches' paths until dropped.
+/// Generous enough for a primary that is still opening its window.
+pub const TIMING: Timing = Timing { handoff: Duration::from_secs(10), ack: Duration::from_secs(8), request: Duration::from_secs(5) };
+
+/// Outcome of [`claim`].
+pub enum Launch {
+    /// This process is the running instance; keep [`Primary`] alive and attach it to the app.
+    Primary(Primary),
+    /// The running instance took the paths; this process should exit.
+    Forwarded,
+    /// Couldn't do either (reason given): run as an independent instance.
+    Standalone(String),
+}
+
+/// What decides whether a launch takes part (see [`skip_reason`]).
+#[derive(Clone, Copy)]
+pub struct LaunchContext<'a> {
+    /// The settings folder is the platform's per-user one (not portable, not an override).
+    pub per_user_settings: bool,
+    /// `--new-instance`.
+    pub new_instance_flag: bool,
+    /// `PHOTOCRAFT_NEW_INSTANCE`, if set.
+    pub new_instance_env: Option<&'a str>,
+    /// `--control` or `PHOTOCRAFT_CONTROL_PORT`: automation gets its own process.
+    pub control: bool,
+    /// Paths that aren't valid Unicode: this launch reports them.
+    pub unreadable_paths: bool,
+    /// Options that only apply to the process they're given to (`--safe-gpu`, …).
+    pub launch_options: &'a [&'static str],
+}
+
+/// Why this launch runs as its own instance, or `None` to take part in single-instance.
+pub fn skip_reason(c: &LaunchContext) -> Option<String> {
+    if !c.per_user_settings {
+        return Some("the settings folder isn't the per-user one (portable or PHOTOCRAFT_CONFIG_DIR)".into());
+    }
+    if c.new_instance_flag || c.new_instance_env.is_some_and(|v| !v.is_empty() && v != "0") {
+        return Some("--new-instance".into());
+    }
+    if c.control {
+        return Some("automation (--control) runs its own process".into());
+    }
+    if c.unreadable_paths {
+        return Some("some paths aren't valid Unicode".into());
+    }
+    if !c.launch_options.is_empty() {
+        return Some(format!("{} only applies to a new process", c.launch_options.join(", ")));
+    }
+    None
+}
+
+/// The running instance: holds the lock and receives other launches' paths.
 pub struct Primary {
-    _lock: File,
-    inbox: Arc<Inbox>,
+    lock: Mutex<Option<File>>,
+    shared: Arc<Shared>,
+}
+
+struct Shared {
+    inbox: Mutex<Inbox>,
+    /// Set by [`Primary::shutdown`]: new connections are dropped, waiting ones refused.
+    closed: AtomicBool,
 }
 
 #[derive(Default)]
 struct Inbox {
-    closed: AtomicBool,
-    state: Mutex<InboxState>,
+    pending: Vec<Pending>,
+    ctx: Option<egui::Context>,
+    next_id: u64,
 }
 
-#[derive(Default)]
-struct InboxState {
-    opens: Vec<Vec<String>>,
-    wake: Option<Box<dyn Fn() + Send>>,
-}
-
-impl Inbox {
-    fn push(&self, paths: Vec<String>) {
-        let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        s.opens.push(paths);
-        if let Some(wake) = &s.wake {
-            wake();
-        }
-    }
+/// Paths waiting for the UI; `taken` tells the connection that sent them.
+struct Pending {
+    id: u64,
+    paths: Vec<String>,
+    taken: SyncSender<()>,
 }
 
 impl Primary {
-    /// The queue the UI drains (see `Services::os_events`); a later launch's files wake `ctx`.
-    pub fn connect(&self, ctx: &egui::Context) -> photocraft_ui_egui::OsEventsFn {
-        let ctx = ctx.clone();
-        let inbox = self.inbox.clone();
-        {
-            let mut s = inbox.state.lock().unwrap_or_else(PoisonError::into_inner);
-            s.wake = Some(Box::new(move || ctx.request_repaint()));
+    /// The queue the UI drains (see `Services::os_events`); a later launch wakes `ctx`.
+    pub fn connect(&self, ctx: &egui::Context) -> OsEventsFn {
+        let mut inbox = self.shared.inbox.lock().unwrap_or_else(PoisonError::into_inner);
+        if !inbox.pending.is_empty() {
+            ctx.request_repaint();
         }
-        Box::new(move || {
-            let opens = std::mem::take(&mut inbox.state.lock().unwrap_or_else(PoisonError::into_inner).opens);
-            opens.into_iter().map(OsEvent::Open).collect()
-        })
+        inbox.ctx = Some(ctx.clone());
+        drop(inbox);
+        let shared = Arc::clone(&self.shared);
+        Box::new(move || shared.take())
+    }
+
+    /// Stop taking files and release the lock: launches waiting on this one are refused and take
+    /// the lock over themselves. Call when the event loop has ended, and before relaunching.
+    pub fn shutdown(&self) {
+        self.shared.closed.store(true, Ordering::Release);
+        // Dropping the senders refuses every connection still waiting for the UI.
+        self.shared.inbox.lock().unwrap_or_else(PoisonError::into_inner).pending.clear();
+        drop(self.lock.lock().unwrap_or_else(PoisonError::into_inner).take());
     }
 }
 
 impl Drop for Primary {
-    /// Stops accepting: a launch arriving now must open its own window, not hand off to an
-    /// instance on its way out (the CPU-fallback relaunch in `main` drops this first).
     fn drop(&mut self) {
-        self.inbox.closed.store(true, Ordering::SeqCst);
+        self.shutdown();
     }
 }
 
-/// Hands `files` to a running instance, or becomes the instance later launches hand off to.
-pub fn start(dir: Option<&Path>, files: &[String]) -> Start {
-    let Some(dir) = dir else { return Start::Run(None) };
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        log::warn!("single instance: {e}");
-        return Start::Run(None);
+impl Shared {
+    /// Everything queued, acknowledged to the senders while the inbox is locked (see `hand_over`).
+    fn take(&self) -> Vec<OsEvent> {
+        let mut inbox = self.inbox.lock().unwrap_or_else(PoisonError::into_inner);
+        inbox
+            .pending
+            .drain(..)
+            .map(|p| {
+                let _ = p.taken.try_send(());
+                OsEvent::Open(p.paths)
+            })
+            .collect()
     }
-    let lock_path = dir.join("instance.lock");
-    let info_path = dir.join("instance");
-    let paths: Vec<String> = files.iter().map(|f| absolute(f)).collect();
-    let deadline = Instant::now() + HANDOFF_WAIT;
-    loop {
-        let lock = match OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path) {
-            Ok(f) => f,
-            Err(e) => {
-                log::warn!("single instance: {}: {e}", lock_path.display());
-                return Start::Run(None);
+
+    /// Queue `paths` for the UI and wait up to `wait` for it to take them. False (and nothing left
+    /// queued) when it didn't: the sender then retries or starts its own instance.
+    fn hand_over(&self, paths: Vec<String>, wait: Duration) -> bool {
+        let (taken, rx) = sync_channel(1);
+        let id = {
+            let mut inbox = self.inbox.lock().unwrap_or_else(PoisonError::into_inner);
+            if self.closed.load(Ordering::Acquire) {
+                return false;
             }
+            let id = inbox.next_id;
+            inbox.next_id = id.wrapping_add(1);
+            inbox.pending.push(Pending { id, paths, taken });
+            if let Some(ctx) = &inbox.ctx {
+                ctx.request_repaint();
+            }
+            id
         };
+        if rx.recv_timeout(wait).is_ok() {
+            return true;
+        }
+        // Timed out or refused: withdraw, unless the UI took them in the meantime (it acknowledges
+        // while holding the lock, so the answer is settled here).
+        let mut inbox = self.inbox.lock().unwrap_or_else(PoisonError::into_inner);
+        if rx.try_recv().is_ok() {
+            return true;
+        }
+        inbox.pending.retain(|p| p.id != id);
+        false
+    }
+}
+
+/// Become the running instance under `dir` or hand `paths` (absolute) to the one that is.
+pub fn claim(dir: &Path, paths: &[String]) -> Launch {
+    claim_with(dir, paths, TIMING)
+}
+
+/// [`claim`] with explicit timeouts. Until `timing.handoff` runs out, each round tries the lock
+/// (free once a quitting or crashed primary is gone) and then the running primary.
+pub fn claim_with(dir: &Path, paths: &[String], timing: Timing) -> Launch {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        return Launch::Standalone(format!("{}: {e}", dir.display()));
+    }
+    let lock_path = dir.join(LOCK_FILE);
+    let lock = match OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&lock_path) {
+        Ok(lock) => lock,
+        Err(e) => return Launch::Standalone(format!("{}: {e}", lock_path.display())),
+    };
+    let deadline = Instant::now() + timing.handoff;
+    let mut last = "no instance.json".to_string();
+    loop {
         match lock.try_lock() {
-            Ok(()) => return Start::Run(become_primary(lock, &info_path)),
-            Err(std::fs::TryLockError::WouldBlock) => {}
-            Err(std::fs::TryLockError::Error(e)) => {
-                log::warn!("single instance: can't lock {}: {e}", lock_path.display());
-                return Start::Run(None);
-            }
-        }
-        drop(lock);
-        match hand_off(&info_path, &paths) {
             Ok(()) => {
-                log::info!("handed {} file(s) to the running PhotoCraft", paths.len());
-                return Start::HandedOff;
+                return match serve(dir, lock, timing) {
+                    Ok(primary) => Launch::Primary(primary),
+                    Err(e) => Launch::Standalone(e),
+                };
             }
-            Err(e) if Instant::now() >= deadline => {
-                log::warn!("single instance: the running PhotoCraft didn't answer ({e}); opening a new window");
-                return Start::Run(None);
-            }
-            // Not listening yet (still starting) or on its way out (then the lock frees up).
-            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(e)) => return Launch::Standalone(format!("{}: {e}", lock_path.display())),
         }
+        if let Some((port, token)) = read_info(dir) {
+            match send(port, &token, paths, deadline) {
+                Ok(()) => return Launch::Forwarded,
+                Err(e) => last = e,
+            }
+        }
+        if Instant::now() >= deadline {
+            return Launch::Standalone(format!("the running PhotoCraft didn't take the files ({last})"));
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
-fn absolute(file: &str) -> String {
-    std::path::absolute(file).map_or_else(|_| file.to_owned(), |p| p.to_string_lossy().into_owned())
-}
-
-/// Listens for later launches; `None` (no handoffs, but still a window) if that can't be set up.
-fn become_primary(lock: File, info_path: &Path) -> Option<Primary> {
-    let listener = match TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))) {
-        Ok(l) => l,
-        Err(e) => {
-            log::warn!("single instance: can't listen: {e}");
-            return None;
-        }
-    };
-    let port = listener.local_addr().ok()?.port();
-    let token = match new_token() {
-        Ok(t) => t,
-        Err(e) => {
-            log::warn!("single instance: {e}");
-            return None;
-        }
-    };
-    if let Err(e) = write_info(info_path, port, &token) {
-        log::warn!("single instance: {}: {e}", info_path.display());
-        return None;
-    }
-    let inbox = Arc::new(Inbox::default());
-    let receiving = inbox.clone();
+fn serve(dir: &Path, lock: File, timing: Timing) -> Result<Primary, String> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|e| format!("loopback listener: {e}"))?;
+    let port = listener.local_addr().map_err(|e| format!("loopback listener: {e}"))?.port();
+    let token = generate_token().map_err(|e| e.to_string())?;
+    write_info(dir, port, &token)?;
+    let shared = Arc::new(Shared { inbox: Mutex::default(), closed: AtomicBool::new(false) });
+    let listening = Arc::clone(&shared);
     let spawned = std::thread::Builder::new().name("single-instance".into()).spawn(move || {
-        for stream in listener.incoming() {
-            if receiving.closed.load(Ordering::SeqCst) {
-                break;
+        let token = Arc::new(token);
+        let clients = Arc::new(AtomicUsize::new(0));
+        loop {
+            let stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                // Back off instead of spinning when accept keeps failing (e.g. out of descriptors).
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+            };
+            // Closing: the sender sees the connection drop and takes the lock over.
+            if listening.closed.load(Ordering::Acquire) {
+                continue;
             }
-            let Ok(stream) = stream else { continue };
-            // Accepted only while still open: on the way out, no `ok`, so the sender opens a
-            // window of its own rather than handing its files to an instance about to exit.
-            match receive(stream, &token, &receiving.closed) {
-                Ok(paths) => receiving.push(paths),
-                Err(e) => log::warn!("single instance: rejected a handoff: {e}"),
+            // Each launch on its own thread, so one that connects and stalls doesn't hold the
+            // ones after it; past the cap a connection is dropped and that launch retries.
+            if clients.fetch_add(1, Ordering::AcqRel) >= MAX_CLIENTS {
+                clients.fetch_sub(1, Ordering::AcqRel);
+                continue;
+            }
+            let (token, shared, slot) = (Arc::clone(&token), Arc::clone(&listening), Arc::clone(&clients));
+            let spawned = std::thread::Builder::new().name("single-instance-client".into()).spawn(move || {
+                serve_client(stream, &token, &shared, timing);
+                slot.fetch_sub(1, Ordering::AcqRel);
+            });
+            if spawned.is_err() {
+                clients.fetch_sub(1, Ordering::AcqRel);
             }
         }
     });
-    if let Err(e) = spawned {
-        log::warn!("single instance: {e}");
+    spawned.map_err(|e| format!("single-instance listener thread: {e}"))?;
+    Ok(Primary { lock: Mutex::new(Some(lock)), shared })
+}
+
+/// Read one request, hand its paths to the UI and answer `ok` only if the UI took them.
+fn serve_client(stream: TcpStream, token: &str, shared: &Shared, timing: Timing) {
+    let taken = match read_request(&stream, timing.request) {
+        Some(line) => match parse_request(&line, token) {
+            Some((paths, wait)) => shared.hand_over(paths, wait.min(timing.ack)),
+            None => false,
+        },
+        None => return,
+    };
+    let reply = if taken { json!({"ok": true}) } else { json!({"ok": false, "error": "not taken"}) };
+    let mut out = stream;
+    let _ = out.set_write_timeout(Some(timing.request));
+    let _ = writeln!(out, "{reply}").and_then(|()| out.flush());
+}
+
+/// A reader that fails once `until` passes, however slowly the bytes trickle in.
+struct Deadline<'a> {
+    stream: &'a TcpStream,
+    until: Instant,
+}
+
+impl Read for Deadline<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.until.checked_duration_since(Instant::now()).filter(|d| !d.is_zero());
+        let left = left.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "request deadline passed"))?;
+        self.stream.set_read_timeout(Some(left))?;
+        let mut stream = self.stream;
+        stream.read(buf)
+    }
+}
+
+/// The request line, if it arrives complete within `total`.
+fn read_request(stream: &TcpStream, total: Duration) -> Option<String> {
+    let mut reader = BufReader::new(Deadline { stream, until: Instant::now() + total });
+    let mut line = String::new();
+    matches!(read_bounded_line(&mut reader, &mut line), Ok(LineRead::Line)).then_some(line)
+}
+
+/// Port and token, written to a temporary file and renamed so a reader never sees half of it.
+/// On Unix the file is the user's alone (0600): another local user who read the token could make
+/// this app open any path. (Windows keeps the per-user ACL of the settings folder.)
+fn write_info(dir: &Path, port: u16, token: &str) -> Result<(), String> {
+    let path = dir.join(INFO_FILE);
+    let tmp = dir.join(format!("{INFO_FILE}.{}.tmp", std::process::id()));
+    let body = json!({"port": port, "token": token, "pid": std::process::id()}).to_string();
+    // A leftover from a crash could carry wider permissions; the mode applies only on create.
+    let _ = std::fs::remove_file(&tmp);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let written = options.open(&tmp).and_then(|mut f| f.write_all(body.as_bytes())).and_then(|()| std::fs::rename(&tmp, &path));
+    written.map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", path.display())
+    })
+}
+
+fn read_info(dir: &Path) -> Option<(u16, String)> {
+    let v: Value = serde_json::from_slice(&std::fs::read(dir.join(INFO_FILE)).ok()?).ok()?;
+    let port = u16::try_from(v.get("port")?.as_u64()?).ok()?;
+    Some((port, v.get("token")?.as_str()?.to_string()))
+}
+
+/// `{"token":…,"open":[…],"wait_ms":…}`: the paths, and how long the sender will wait for the UI.
+fn parse_request(line: &str, token: &str) -> Option<(Vec<String>, Duration)> {
+    let v: Value = serde_json::from_str(line).ok()?;
+    if !token_matches(token, v.get("token")?.as_str()?) {
         return None;
     }
-    Some(Primary { _lock: lock, inbox })
+    let open = v.get("open")?.as_array()?;
+    if open.len() > MAX_PATHS {
+        return None;
+    }
+    let paths = open.iter().map(|p| p.as_str().map(str::to_string)).collect::<Option<Vec<_>>>()?;
+    let wait = Duration::from_millis(v.get("wait_ms").and_then(Value::as_u64).unwrap_or(0));
+    Some((paths, wait))
 }
 
-fn new_token() -> Result<String, String> {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).map_err(|e| format!("no random token: {e}"))?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-/// Writes `port` and `token` beside the lock, replacing the file whole.
-fn write_info(path: &Path, port: u16, token: &str) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, json!({"port": port, "token": token, "pid": std::process::id()}).to_string())?;
-    std::fs::rename(&tmp, path)
-}
-
-/// The running instance's port, token and process id (`None` in a file written before it was kept).
-fn read_info(path: &Path) -> Result<(u16, String, Option<u32>), String> {
-    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    let port = v.get("port").and_then(Value::as_u64).and_then(|p| u16::try_from(p).ok()).ok_or("no port")?;
-    let token = v.get("token").and_then(Value::as_str).ok_or("no token")?;
-    let pid = v.get("pid").and_then(Value::as_u64).and_then(|p| u32::try_from(p).ok());
-    Ok((port, token.to_owned(), pid))
-}
-
-/// Sends `paths` to the running instance; `Ok` once it has accepted them.
-fn hand_off(info_path: &Path, paths: &[String]) -> Result<(), String> {
-    let (port, token, pid) = read_info(info_path)?;
+/// Offer `paths` to the primary on `port`; `Ok` once its UI has taken them.
+fn send(port: u16, token: &str, paths: &[String], deadline: Instant) -> Result<(), String> {
+    let left = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()).ok_or("out of time")?;
     // Windows only lets the app the user just launched take the foreground: pass that right on,
-    // so the running window can come to the front instead of just flashing in the taskbar.
-    #[cfg(not(windows))]
-    let _ = pid;
+    // so the running window comes to the front instead of only flashing in the taskbar.
     #[cfg(windows)]
-    let _ = winsafe::AllowSetForegroundWindow(Some(pid.unwrap_or(u32::MAX)));
+    let _ = winsafe::AllowSetForegroundWindow(None);
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500)).map_err(|e| e.to_string())?;
-    stream.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
-    stream.set_write_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
-    writeln!(stream, "{}", json!({"token": token, "paths": paths})).map_err(|e| e.to_string())?;
-    let mut reply = String::new();
-    BufReader::new(stream.take(16)).read_line(&mut reply).map_err(|e| e.to_string())?;
-    if reply.trim() == "ok" { Ok(()) } else { Err(format!("unexpected reply {reply:?}")) }
-}
-
-/// Reads one handoff from `stream`, answering `ok` if it carries `token`.
-fn receive(mut stream: TcpStream, token: &str, closed: &AtomicBool) -> Result<Vec<String>, String> {
-    stream.set_read_timeout(Some(Duration::from_secs(2))).map_err(|e| e.to_string())?;
-    stream.set_write_timeout(Some(Duration::from_secs(2))).map_err(|e| e.to_string())?;
+    let mut stream = TcpStream::connect_timeout(&addr, left).map_err(|e| e.to_string())?;
+    // The primary must answer before our deadline, so it waits a little less than we do.
+    let wait_ms = u64::try_from(left.saturating_sub(REPLY_MARGIN).as_millis()).unwrap_or(u64::MAX);
+    let request = json!({"token": token, "open": paths, "wait_ms": wait_ms});
+    stream.set_write_timeout(Some(left)).map_err(|e| e.to_string())?;
+    writeln!(stream, "{request}").and_then(|()| stream.flush()).map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(Deadline { stream: &stream, until: deadline });
     let mut line = String::new();
-    BufReader::new((&stream).take(MAX_MESSAGE)).read_line(&mut line).map_err(|e| e.to_string())?;
-    let paths = parse_message(&line, token)?;
-    if closed.load(Ordering::SeqCst) {
-        return Err("closing".into());
+    match read_bounded_line(&mut reader, &mut line) {
+        Ok(LineRead::Line) => {}
+        Ok(_) => return Err("no reply".into()),
+        Err(e) => return Err(e.to_string()),
     }
-    stream.write_all(b"ok\n").map_err(|e| e.to_string())?;
-    Ok(paths)
+    let ok = serde_json::from_str::<Value>(&line).ok().and_then(|v| v.get("ok")?.as_bool()) == Some(true);
+    if ok { Ok(()) } else { Err("not taken".into()) }
 }
 
-/// The paths in a handoff line, if it carries `token`.
-fn parse_message(line: &str, token: &str) -> Result<Vec<String>, String> {
-    let v: Value = serde_json::from_str(line.trim()).map_err(|e| format!("not JSON: {e}"))?;
-    if v.get("token").and_then(Value::as_str) != Some(token) {
-        return Err("wrong token".into());
-    }
-    let paths = v.get("paths").and_then(Value::as_array).ok_or("no paths")?;
-    Ok(paths.iter().filter_map(Value::as_str).take(MAX_PATHS).map(str::to_owned).collect())
-}
-
-/// Whether this start should take part (see the module docs).
-pub fn wanted(control: bool, new_instance_flag: bool) -> bool {
-    !cfg!(target_os = "macos")
-        && !control
-        && !new_instance_flag
-        && std::env::var_os("PHOTOCRAFT_NEW_INSTANCE").is_none_or(|v| v.is_empty() || v == "0")
-}
-
-/// The settings folder the lock lives in.
-pub fn dir() -> Option<PathBuf> {
-    crate::services::config_dir()
+/// Absolute form of a command-line path, so the running instance (another working directory)
+/// opens the same file.
+pub fn absolute(path: &str) -> String {
+    std::path::absolute(path).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| path.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::sync::mpsc::channel;
+
+    const FAST: Timing = Timing { handoff: Duration::from_millis(1500), ack: Duration::from_millis(500), request: Duration::from_millis(800) };
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("photocraft-single-instance-{name}-{}", std::process::id()));
@@ -271,50 +415,238 @@ mod tests {
         dir
     }
 
+    /// Launch with `paths` on another thread (it blocks until the primary's UI takes them).
+    fn launch(dir: &Path, paths: &[&str], timing: Timing) -> std::thread::JoinHandle<Launch> {
+        let (dir, paths): (PathBuf, Vec<String>) = (dir.to_path_buf(), paths.iter().map(|p| p.to_string()).collect());
+        std::thread::spawn(move || claim_with(&dir, &paths, timing))
+    }
+
+    /// Play the UI: drain until `n` events arrived (or 5 s passed).
+    fn drain(ui: &mut OsEventsFn, n: usize) -> Vec<OsEvent> {
+        let mut got = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while got.len() < n && Instant::now() < deadline {
+            got.extend(ui());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        got
+    }
+
+    fn primary(dir: &Path) -> Primary {
+        match claim_with(dir, &[], FAST) {
+            Launch::Primary(p) => p,
+            _ => panic!("first launch should be primary"),
+        }
+    }
+
     #[test]
-    fn a_second_start_hands_its_files_to_the_first() {
+    fn second_launch_hands_its_paths_to_the_first() {
         let dir = temp_dir("handoff");
-        let Start::Run(Some(primary)) = start(Some(&dir), &[]) else { panic!("the first start runs and listens") };
-        let ctx = egui::Context::default();
-        let mut drain = primary.connect(&ctx);
-        let file = dir.join("a.psd").to_string_lossy().into_owned();
-        assert!(matches!(start(Some(&dir), std::slice::from_ref(&file)), Start::HandedOff));
-        assert_eq!(drain(), vec![OsEvent::Open(vec![file])]);
-        assert!(drain().is_empty());
-        // No files: just brings the running window forward.
-        assert!(matches!(start(Some(&dir), &[]), Start::HandedOff));
-        assert_eq!(drain(), vec![OsEvent::Open(vec![])]);
+        let primary = primary(&dir);
+        let mut ui = primary.connect(&egui::Context::default());
+        let paths = ["C:\\art\\one.psd", "/home/a/two é.png"];
+        let second = launch(&dir, &paths, TIMING);
+        assert_eq!(drain(&mut ui, 1), vec![OsEvent::Open(paths.iter().map(|p| p.to_string()).collect())]);
+        assert!(matches!(second.join().unwrap(), Launch::Forwarded));
+        // A plain second start (no files) just brings the window forward.
+        let third = launch(&dir, &[], TIMING);
+        assert_eq!(drain(&mut ui, 1), vec![OsEvent::Open(Vec::new())]);
+        assert!(matches!(third.join().unwrap(), Launch::Forwarded));
         drop(primary);
-        // Gone: the next start is the first instance again (the stale `instance` file is ignored).
-        assert!(matches!(start(Some(&dir), &[]), Start::Run(Some(_))));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn relative_paths_are_made_absolute() {
-        let p = absolute("pic.png");
-        assert!(Path::new(&p).is_absolute(), "{p}");
-    }
-
-    #[test]
-    fn hostile_handoffs_are_rejected_without_panicking() {
-        for line in ["", "garbage", "{}", r#"{"token":"x","paths":[]}"#, r#"{"token":"t"}"#, r#"{"token":"t","paths":"a"}"#, "\u{0}\u{ffff}"] {
-            assert!(parse_message(line, "t").is_err(), "{line:?}");
+    fn simultaneous_launches_all_land_in_one_instance() {
+        let dir = temp_dir("race");
+        let (tx, rx) = channel();
+        for i in 0..6 {
+            let (dir, tx) = (dir.clone(), tx.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(claim(&dir, &[format!("file{i}.psd")]));
+            });
         }
-        assert_eq!(parse_message(r#"{"token":"t","paths":["a",1,null,"b"]}"#, "t"), Ok(vec!["a".into(), "b".into()]));
-        let many = json!({"token": "t", "paths": vec!["p"; MAX_PATHS + 10]}).to_string();
-        assert_eq!(parse_message(&many, "t").map(|p| p.len()), Ok(MAX_PATHS));
+        drop(tx);
+        let (mut primaries, mut forwarded, mut events) = (Vec::new(), 0, Vec::new());
+        let mut ui: Option<OsEventsFn> = None;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while primaries.len() + forwarded < 6 && Instant::now() < deadline {
+            while let Ok(launch) = rx.try_recv() {
+                match launch {
+                    Launch::Primary(p) => primaries.push(p),
+                    Launch::Forwarded => forwarded += 1,
+                    Launch::Standalone(reason) => panic!("standalone: {reason}"),
+                }
+            }
+            if ui.is_none()
+                && let Some(p) = primaries.first()
+            {
+                ui = Some(p.connect(&egui::Context::default()));
+            }
+            if let Some(ui) = ui.as_mut() {
+                events.extend(ui());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!((primaries.len(), forwarded, events.len()), (1, 5, 5));
+        drop(primaries);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn a_corrupt_instance_file_is_an_error_not_a_crash() {
-        let dir = temp_dir("corrupt");
+    fn a_crashed_instance_leaves_nothing_in_the_way() {
+        let dir = temp_dir("stale");
         std::fs::create_dir_all(&dir).unwrap();
-        let info = dir.join("instance");
-        for text in ["", "{", r#"{"port":99999,"token":"t"}"#, r#"{"port":1}"#] {
-            std::fs::write(&info, text).unwrap();
-            assert!(read_info(&info).is_err(), "{text:?}");
-        }
+        // instance.json from a process that is gone; the lock is free.
+        std::fs::write(dir.join(INFO_FILE), r#"{"port":1,"token":"x","pid":1}"#).unwrap();
+        let primary = primary(&dir);
+        assert!(read_info(&dir).is_some_and(|(port, _)| port != 1));
+        drop(primary);
+        // Released with the handle, as on process exit.
+        assert!(matches!(claim_with(&dir, &[], FAST), Launch::Primary(_)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review of #3755, point 1 (and the quitting half of point 3): a launch waiting on a primary
+    /// that shuts down (closing, or about to relaunch itself in CPU mode) isn't told `ok`; it takes
+    /// the lock over and opens the file itself.
+    #[test]
+    fn a_launch_waiting_on_a_closing_instance_takes_over() {
+        let dir = temp_dir("closing");
+        let primary = primary(&dir);
+        // The UI never drains (it is shutting down, or never came up).
+        let waiting = launch(&dir, &["a.psd"], FAST);
+        std::thread::sleep(Duration::from_millis(200));
+        primary.shutdown();
+        assert!(matches!(waiting.join().unwrap(), Launch::Primary(_)), "the waiting launch becomes the primary");
+        // After shutdown new connections are refused too.
+        let (port, token) = read_info(&dir).unwrap();
+        drop(primary);
+        let short = Instant::now() + Duration::from_millis(300);
+        assert!(send(port, &token, &["b.psd".into()], short).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review of #3755, point 3: a primary whose UI never takes the paths (hung) doesn't
+    /// acknowledge them, and doesn't keep them queued to open later as well.
+    #[test]
+    fn a_hung_instance_never_swallows_a_file() {
+        let dir = temp_dir("hung-ui");
+        let primary = primary(&dir);
+        let mut ui = primary.connect(&egui::Context::default());
+        let started = Instant::now();
+        assert!(matches!(claim_with(&dir, &["a.psd".into()], FAST), Launch::Standalone(_)));
+        assert!(started.elapsed() < FAST.handoff + Duration::from_secs(1), "{:?}", started.elapsed());
+        assert!(ui().is_empty(), "withdrawn, not opened later");
+        drop(primary);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn requests_without_the_token_or_malformed_are_rejected() {
+        let token = generate_token().unwrap();
+        let ok = parse_request(&json!({"token": token, "open": ["a"], "wait_ms": 250}).to_string(), &token);
+        assert_eq!(ok, Some((vec!["a".to_string()], Duration::from_millis(250))));
+        let wrong = generate_token().unwrap();
+        assert_eq!(parse_request(&json!({"token": wrong, "open": ["a"]}).to_string(), &token), None);
+        for bad in ["", "not json", "{}", r#"{"token":5}"#, &json!({"token": token}).to_string(), &json!({"token": token, "open": [1]}).to_string()] {
+            assert_eq!(parse_request(bad, &token), None, "{bad:?}");
+        }
+        let many: Vec<String> = (0..=MAX_PATHS).map(|i| i.to_string()).collect();
+        assert_eq!(parse_request(&json!({"token": token, "open": many}).to_string(), &token), None);
+    }
+
+    #[test]
+    fn a_stalled_client_does_not_hold_up_the_next_launch() {
+        let dir = temp_dir("stalled");
+        let primary = primary(&dir);
+        let mut ui = primary.connect(&egui::Context::default());
+        let (port, _) = read_info(&dir).unwrap();
+        // Connects and never sends a line (each would otherwise hold the listener).
+        let stalled: Vec<TcpStream> = (0..3).map(|_| TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap()).collect();
+        let started = Instant::now();
+        let next = launch(&dir, &["b.psd"], FAST);
+        assert_eq!(drain(&mut ui, 1), vec![OsEvent::Open(vec!["b.psd".into()])]);
+        assert!(matches!(next.join().unwrap(), Launch::Forwarded));
+        assert!(started.elapsed() < FAST.request, "took {:?}", started.elapsed());
+        drop(stalled);
+        drop(primary);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A client that trickles a byte at a time can't keep its slot past the request deadline.
+    #[test]
+    fn a_trickling_client_is_cut_off_at_the_request_deadline() {
+        let dir = temp_dir("trickle");
+        let primary = primary(&dir);
+        let (port, _) = read_info(&dir).unwrap();
+        let mut slow = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        let started = Instant::now();
+        let mut cut_off = false;
+        while started.elapsed() < FAST.request * 4 {
+            if slow.write_all(b"{").is_err() {
+                cut_off = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(cut_off, "still connected after {:?}", started.elapsed());
+        assert!(started.elapsed() < FAST.request * 3, "{:?}", started.elapsed());
+        drop(primary);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_token_file_is_private_to_the_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("mode");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A wide leftover temporary file from a crashed start doesn't widen the new one.
+        let tmp = dir.join(format!("{INFO_FILE}.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, "{}").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_info(&dir, 1, &generate_token().unwrap()).unwrap();
+        let mode = std::fs::metadata(dir.join(INFO_FILE)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreachable_instance_falls_back_to_a_standalone_launch() {
+        let dir = temp_dir("unreachable");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Someone holds the lock but nothing listens on the advertised port.
+        let held = File::create(dir.join(LOCK_FILE)).unwrap();
+        held.lock().unwrap();
+        let closed = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap().port();
+        write_info(&dir, closed, &generate_token().unwrap()).unwrap();
+        assert!(matches!(claim_with(&dir, &["a.psd".into()], FAST), Launch::Standalone(_)));
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review of #3755, point 2 and the smaller points: who takes part in single-instance.
+    #[test]
+    fn only_per_user_launches_without_process_options_take_part() {
+        let base = LaunchContext {
+            per_user_settings: true,
+            new_instance_flag: false,
+            new_instance_env: None,
+            control: false,
+            unreadable_paths: false,
+            launch_options: &[],
+        };
+        assert_eq!(skip_reason(&base), None);
+        // A portable copy's folder or a PHOTOCRAFT_CONFIG_DIR may be shared between users.
+        assert!(skip_reason(&LaunchContext { per_user_settings: false, ..base }).is_some());
+        assert!(skip_reason(&LaunchContext { new_instance_flag: true, ..base }).is_some());
+        assert!(skip_reason(&LaunchContext { new_instance_env: Some("1"), ..base }).is_some());
+        assert_eq!(skip_reason(&LaunchContext { new_instance_env: Some("0"), ..base }), None);
+        assert_eq!(skip_reason(&LaunchContext { new_instance_env: Some(""), ..base }), None);
+        assert!(skip_reason(&LaunchContext { control: true, ..base }).is_some());
+        assert!(skip_reason(&LaunchContext { unreadable_paths: true, ..base }).is_some());
+        let reason = skip_reason(&LaunchContext { launch_options: &["--safe-gpu"], ..base });
+        assert!(reason.is_some_and(|r| r.contains("--safe-gpu")));
     }
 }
